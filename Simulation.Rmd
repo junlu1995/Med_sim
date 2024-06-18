@@ -1,0 +1,341 @@
+---
+title: "Simulation"
+author: "Jun Lu"
+date: "2024-05-27"
+output: html_document
+---
+
+```{r}
+library(plyr)
+library(rjags)
+library(MCMCvis)
+library(doParallel)
+library(foreach)
+cl = parallel::makeCluster(8)
+doParallel::registerDoParallel(cl)
+source("./f.R")
+# source("./nimble_code/tte.R")
+```
+
+## S1
+Sample Size: 500, 1000, 2000
+3 Cluster
+Same slope different intercept for different clusters
+10% censoring
+```{r}
+# Sample size
+n = 500
+
+# Binary exposure
+A = rbinom(n, 1, 0.5)
+
+# Coefficient matrix
+X1 = cbind(rep(1, n), A)
+X2 = X1
+
+# cluster number
+K = 3
+
+# Coefficients latent class membership
+gamma = matrix(c(0,  0, 
+                 0,  0, 
+                 0.5, 1), nrow = 3, ncol = 2)
+
+
+# Coefficients in informative cluster size
+theta = c(0.8,  1,  1.2)
+alpha = 30
+
+# Coefficients Survival outcome
+sigma = 1
+alpha2 = 1/sigma 
+phi = matrix(c(1, 1,
+               2, 1,
+               5, 1), nrow = 3, ncol = 2, byrow = T)
+perc = 0.1
+
+# Coefficients in Longitudinal Model
+sigma_b0 = 2
+sigma_M =  1
+beta = matrix(c(0, 5, 
+                10, 5, 
+                20, 5), 
+              nrow = 3, ncol = 2, byrow = T)
+
+true_prop = mediation_effect(gamma, phi, X1, X2, K)
+```
+
+
+```{r}
+system.time({s1_500 = foreach::foreach(i = 1:8,
+                     .combine = rbind,
+                     .packages = c("tidyverse", "nlme", "nnet", "survival", "rjags", 
+                                   "eha")) %dopar% {
+  d_long = sim_data(n, X1, X2, K, gamma, theta, alpha, alpha2, phi,
+                    perc, sigma_b0, sigma_M, beta) 
+  d_subject = d_long %>% dplyr::select(-time, -M) %>% distinct()
+  # d_subject %>% group_by(lc, A) %>% dplyr::summarise(n = n())
+  intital = initial_values(d_long, K)
+  s = rep(0, n)
+  e = rep(0, n)
+  # Some issue with writing loop through longitidinal M in NIMBLE
+  obs_n = d_subject$obs_n
+  s[1] = 1
+  for (i in 1:n) {
+    e[i] = s[i] + obs_n[i]-1
+    if(i != n) {
+      s[i+1] = e[i]+1
+    }
+  }
+  
+   Data <- list(N1 = n,
+             X1 = X1,
+             X2 = X1,
+             Q = 2,
+             P = 2,
+             K = K,
+             s = s,
+             e = e,
+             Time = d_long$time,
+             M = d_long$M, O = d_subject$obs_n - 1, 
+             censured = d_subject$censured,
+             t = d_subject$t, cent = d_subject$cent)
+
+    Inits <- list(L = intital[[1]],
+              gamma = intital[[2]],
+              b0 = intital[[3]],
+              sigma_b = intital[[4]],
+              sigma_M = intital[[5]], 
+              beta = intital[[6]],
+              phi = intital[[7]],
+              alpha2 = intital[[8]],
+              alpha = intital[[9]],
+              theta = intital[[10]])
+    
+    jags_model <- jags.model(file = "model.jags",
+                         data = Data, 
+                         inits = Inits,
+                         n.chains = 1, 
+                         n.adapt = 1000)
+
+    update(jags_model, 10000)
+
+    samples_list <- coda.samples(model = jags_model, 
+                            variable.names = c("gamma", "phi"),
+                            n.iter = 1000)
+    summary(samples_list)
+    samples = samples_list[[1]]
+    
+    
+    re = mediation_summary(samples[,1:4], samples[,5:10], X1, X2, K)
+    mean = colMeans(re)
+    CI_lower = apply(re, 2, quantile, probs = 0.025)
+    CI_upper = apply(re, 2, quantile, probs = 0.975)
+    c(mean, CI_lower, CI_upper)
+                                   }})
+
+
+
+saveRDS(s1_500, "s1_500.rds")
+
+df = s1_500[,c(4,8, 12)] %>% as.data.frame()
+colnames(df) = c("est", "low", "up")
+
+df$true = true_prop [4]
+
+df = df %>% mutate(cover = ifelse(low < true & up > true, 1, 0))
+s1 %>%
+as.numeric(s1[, 8] < true_prop [4] && s1[, 12] > true_prop[4])
+```
+
+
+
+
+
+
+```{r}
+df = s1_500[,c(2,6, 10)] %>% as.data.frame()
+colnames(df) = c("est", "low", "up")
+
+df$true = true_prop [2]
+
+df = df %>% mutate(cover = ifelse(low < true & up > true, 1, 0))
+s1 %>%
+as.numeric(s1[, 8] < true_prop [4] && s1[, 12] > true_prop[4])
+```
+
+
+
+
+
+
+
+
+```{r}
+n = 1000
+s1_1000 = foreach::foreach(i = 1:10,
+                     .combine = rbind,
+                     .packages = c("tidyverse", "nlme", "nnet", "survival", "nimble", 
+                                   "eha")) %dopar% {
+  d_long = sim_data(n, X1, X2, K, gamma, theta, alpha, alpha2, phi,
+                    perc, sigma_b0, sigma_M, beta) 
+  d_subject = d_long %>% dplyr::select(-time, -M) %>% distinct()
+  
+  s = rep(0, n)
+  e = rep(0, n)
+  # Some issue with writing loop through longitidinal M in NIMBLE
+  obs_n = d_subject$obs_n
+  s[1] = 1
+  for (i in 1:n) {
+    e[i] = s[i] + obs_n[i]-1
+    if(i != n) {
+      s[i+1] = e[i]+1
+    }
+  }
+  
+   Consts <- list(N1 = nrow(d_subject),
+                 X1 = X1,
+                 X2 = X2,
+                 Q = ncol(X1),
+                 P = ncol(X2),
+                 K = K,
+                 s = s,
+                 e = e,
+                 Time = d_long$time
+                 )
+   
+   Data <- list(M = d_long$M, 
+                O = obs_n - 1, 
+                censured = d_subject$censured,
+                t = d_subject$t, 
+                cent = d_subject$cent)
+   
+   intital = initial_values(d_long, K)
+   Inits = list(L = intital[[1]],
+                gamma = intital[[2]],
+                b0 = intital[[3]],
+                sigma_b = intital[[4]],
+                sigma_M = intital[[5]], 
+                beta = intital[[6]],
+                phi = intital[[7]],
+                alpha2 = intital[[8]],
+                alpha = intital[[9]],
+                theta = intital[[10]])
+    
+    samples = nimbleMCMC(code = code, 
+                       constants = Consts,
+                       data = Data,
+                       monitors = c("gamma","phi"),
+                       inits = Inits,
+                       nchains = 1,
+                       nburnin = n.burnin,
+                       niter = n.burnin + 1000,
+                       setSeed = TRUE)
+    
+    re = mediation_summary(samples[,1:4], samples[,5:10], X1, X2, K)
+    mean = colMeans(re)
+    CI_lower = apply(re, 2, quantile, probs = 0.025)
+    CI_upper = apply(re, 2, quantile, probs = 0.975)
+    c(mean, CI_lower, CI_upper)
+                                   }
+
+saveRDS(s1_1000, "s1_1000.rds")
+
+# df = s1[,c(4,8, 12)] %>% as.data.frame()
+# colnames(df) = c("est", "low", "up")
+# 
+# df$true = true_prop [4]
+# 
+# df = df %>% mutate(cover = ifelse(low < true & up > true, 1, 0)
+#               )
+# s1 %>% 
+# as.numeric(s1[, 8] < true_prop [4] && s1[, 12] > true_prop[4])
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+n.burnin = 200000
+d_long = sim_data(n, X1, X2, K, gamma, theta, alpha, alpha2, phi,
+                    perc, sigma_b0, sigma_M, beta) 
+d_subject = d_long %>% dplyr::select(-time, -M) %>% distinct()
+  
+s = rep(0, n)
+e = rep(0, n)
+# Some issue with writing loop through longitidinal M in NIMBLE
+obs_n = d_subject$obs_n
+s[1] = 1
+  for (i in 1:n) {
+    e[i] = s[i] + obs_n[i]-1
+    if(i != n) {
+      s[i+1] = e[i]+1
+    }
+  }
+  
+Consts <- list(N1 = nrow(d_subject),
+                 X1 = X1,
+                 X2 = X2,
+                 Q = ncol(X1),
+                 P = ncol(X2),
+                 K = K,
+                 s = s,
+                 e = e,
+                 Time = d_long$time
+                 )
+   
+Data <- list(M = d_long$M, 
+             censured = d_subject$censured,
+             t = d_subject$t, 
+             cent = d_subject$cent)
+   
+intital = initial_values(d_long, K)
+Inits = list(L = intital[[1]],
+                gamma = intital[[2]],
+                b0 = intital[[3]],
+                sigma_b = intital[[4]],
+                sigma_M = intital[[5]], 
+                beta = intital[[6]],
+                phi = intital[[7]],
+                alpha2 = intital[[8]])
+    
+samples = nimbleMCMC(code = code2, 
+                       constants = Consts,
+                       data = Data,
+                       monitors = c("phi", "gamma","alpha2",
+                                    "beta", "sigma_b", "sigma_M"),
+                       inits = Inits,
+                       nchains = 1,
+                       nburnin = n.burnin,
+                       niter = n.burnin + 1000,
+                       setSeed = TRUE)
+```
+
+
+install.packages("usethis")
+library(usethis)
+create_github_token()
+
+

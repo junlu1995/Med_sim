@@ -1,0 +1,157 @@
+---
+title: "data_application2"
+author: "Jun Lu"
+date: "2024-05-27"
+output: html_document
+---
+
+# Load Data
+```{r}
+library(tidyverse)
+library(MCMCvis)
+load("./clean_data/binary_5years.Rdata")
+load("./clean_data/ttedata.Rdata")
+source("f.R")
+source("./nimble_code/tte.R")
+```
+
+# Plot the data
+Issue 1: 890 subjects only have baseline biomarker measurements among 1251 objects (keep or remove them)
+```{r}
+library(survminer)
+
+tte_data %>% 
+  ggplot(aes(y = CSFABETA, x = biomarker_days, color = as.factor(Event))) + 
+  geom_line(aes(group = NACCID)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  facet_grid(.~as.factor(Event)) +
+  theme_bw()
+
+model_fit <- survfit(Surv(Time, Event) ~ APOE, data = tte_data)
+ggsurvplot(model_fit)
+```
+
+# Check mediation analysis using the mean
+```{r}
+library(mediation)
+library(survival)
+new_tte_data = tte_data %>% 
+  arrange(NACCID, biomarker_days) %>% 
+  group_by(NACCID, Event, SEX, EDUC, APOE, age_baseline, Time) %>% 
+  summarise(CSFABETA = mean(CSFABETA))
+
+set.seed(123)
+mod.y <- survreg(Surv(Time, Event) ~ CSFABETA + APOE + SEX + EDUC + age_baseline, data = new_tte_data,
+                 dist = "weibull")
+mod.m <- lm(CSFABETA ~ APOE, data = new_tte_data)
+med.m <- mediate(mod.m, mod.y, treat = "APOE", mediator = "CSFABETA")
+summary(med.m)
+summary(mod.y)
+summary(mod.m)
+```
+
+# Run Model with confounders 
+```{r}
+d_long = tte_data %>% 
+  arrange(NACCID) %>% 
+  dplyr::select(NACCID, Event, CSFABETA, APOE, biomarker_days, Time, age_baseline, 
+         EDUC, SEX) %>% 
+  rename(M = CSFABETA,
+         time = biomarker_days,
+         A = APOE,
+         ID = NACCID,
+         ob_t = Time,
+         delta = Event) %>% 
+  group_by(ID) %>% 
+  mutate(obs_n = n()) %>% 
+  mutate(SEX = as.numeric(as.factor(SEX)) - 1,
+         A = as.numeric(as.factor(A)) - 1)
+
+censured = 1-d_long$delta
+t = d_long$ob_t
+cent = d_long$ob_t
+t[censured==1] = NA
+cent[censured ==0] = Inf
+
+d_subject = d_long %>% dplyr::select(-time, -M) %>% distinct()
+n = nrow(d_subject)
+X1 = cbind(rep(1, n), d_subject$A, d_subject$age_baseline, d_subject$EDUC, d_subject$SEX)
+
+X2 = X1
+obs_n = d_subject$obs_n
+time = d_long$time
+s = rep(0, n)
+e = rep(0, n)
+
+# Some issue with writing loop through longitidinal M in NIMBLE
+s[1] = 1
+for (i in 1:n) {
+  e[i] = s[i] + obs_n[i]-1
+  if(i != n) {
+    s[i+1] = e[i]+1
+  }
+}
+
+Consts <- list(N1 = n,
+               X = X1,
+               Q = 2,
+               P = 5,
+               K = 3,
+               s = s,
+               e = e,
+               Time = d_long$time
+               )
+
+Data <- list(M = d_long$M, O = obs_n - 1, censured = censured,
+             t = t, cent = cent)
+intital = initial_values2(d_long, 3)
+
+Inits <- list(L = intital[[1]],
+                gamma = intital[[2]],
+                b0 = intital[[3]],
+                sigma_b = intital[[4]],
+                sigma_M = intital[[5]], 
+                beta = intital[[6]],
+                phi = intital[[7]],
+                alpha2 = intital[[8]],
+                alpha = intital[[9]],
+                theta = intital[[10]])
+
+n.burnin = 50000
+Rmodel <- nimbleModel(code, Consts, Data, Inits)
+conf <- configureMCMC(Rmodel, print = FALSE, monitors = c('gamma', 'phi'))
+conf$removeSamplers('logDens')   
+conf$addSampler(target = 'logDens', type = 'sumLogPostDens')
+Rmcmc <- buildMCMC(conf)
+Cmodel <- compileNimble(Rmodel)
+Cmcmc <- compileNimble(Rmcmc, project = Rmodel)
+    
+samples <- runMCMC(mcmc = Cmcmc, 
+                   nchains = 1,
+                   niter = n.burnin + 1000,
+                   nburnin = n.burnin,
+                   inits = Inits
+                   )
+    
+    MCMCsummary(object = samples, round = 2)
+    re = matrix(NA, nrow = 500, ncol = 4)
+    for (i in 1:500) {
+      gamma = matrix(samples[i,1:10], nrow = 2, ncol = 5)
+      gamma = rbind(rep(0,5), gamma)
+      phi = matrix(samples[i,11:25], nrow = 3, ncol = 5)
+      re[i,] = mediation_effect(gamma, phi, X1)
+    }
+    
+    colnames(re) = c("NDE", "NIE", "TE", "PROP")
+    mean = colMeans(re)
+    CI_lower = apply(re, 2, quantile, probs = 0.025)
+    CI_upper = apply(re, 2, quantile, probs = 0.975)
+    c(mean, CI_lower, CI_upper)
+
+```
+
+
+
+
+
